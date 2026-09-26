@@ -1,33 +1,30 @@
 // backbutton-close-tab.uc.js
-// Close the current tab when Back is triggered and no back history exists.
+// Back navigates normally when history exists; otherwise it closes the selected unpinned tab.
+// Behavior: native Back when history exists; close only a historyless unpinned tab.
 (function () {
     "use strict";
 
-    const SCRIPT_NAME = "backbuttonCloseTab";
+    const SCRIPT_NAME = "backbuttonCloseTabController";
 
-    // Remove listeners from a previously loaded copy.
-    const previousInstance = window[SCRIPT_NAME];
-    if (previousInstance && typeof previousInstance.destroy === "function") {
-        previousInstance.destroy();
+    const previous = window[SCRIPT_NAME];
+    if (previous && typeof previous.destroy === "function") {
+        previous.destroy();
     }
 
     const CONFIG = Object.freeze({
-        // Trackpad settings
         SWIPE_THRESHOLD_PX: 140,
-        GESTURE_RESET_MS: 260,
-        ACTION_COOLDOWN_MS: 550,
+        GESTURE_RESET_MS: 500,
+        ACTION_COOLDOWN_MS: 900,
         HORIZONTAL_DOMINANCE_RATIO: 1.25,
 
-        // Change to "right" if your trackpad direction is reversed.
+        // Change to "right" only if your trackpad's Back direction is reversed.
         BACK_SWIPE_DIRECTION: "left",
 
-        // Safety options
+        // Pinned tabs are protected. Unpinned tabs may close even when last.
         CLOSE_PINNED_TABS: false,
-        CLOSE_LAST_TAB: false,
 
         DEBUG: false,
 
-        // Zen Browser and Firefox content containers.
         CONTENT_SELECTORS: [
             "#zen-appcontent-wrapper",
             "#appcontent",
@@ -38,14 +35,12 @@
     const state = {
         isClosingTab: false,
         lastActionTime: 0,
-
         lastWheelTime: 0,
         gestureHandled: false,
         backDistance: 0,
         horizontalDistance: 0,
         verticalDistance: 0,
         gestureResetTimer: null,
-
         listeners: []
     };
 
@@ -57,12 +52,7 @@
 
     function addListener(target, type, listener, options) {
         target.addEventListener(type, listener, options);
-        state.listeners.push({
-            target,
-            type,
-            listener,
-            options
-        });
+        state.listeners.push({ target, type, listener, options });
     }
 
     function suppressEvent(event) {
@@ -85,22 +75,13 @@
         return window.gBrowser?.selectedTab || null;
     }
 
-    /**
-     * Returns:
-     * true  = tab can go back
-     * false = tab cannot go back
-     * null  = navigation state could not be determined safely
-     */
+    // true: can navigate back, false: no history, null: could not determine safely.
     function getCanGoBack() {
         try {
             const webNavigation = getSelectedBrowser()?.webNavigation;
-
-            if (!webNavigation) {
-                return null;
-            }
+            if (!webNavigation) return null;
 
             const value = webNavigation.canGoBack;
-
             return typeof value === "function"
                 ? Boolean(value.call(webNavigation))
                 : Boolean(value);
@@ -113,7 +94,7 @@
     function canCloseCurrentTab() {
         const tab = getSelectedTab();
 
-        if (!tab || state.isClosingTab || tab.closing) {
+        if (!tab || tab.closing || state.isClosingTab) {
             return false;
         }
 
@@ -121,12 +102,7 @@
             return false;
         }
 
-        const tabCount = window.gBrowser?.tabs?.length ?? 0;
-
-        if (!CONFIG.CLOSE_LAST_TAB && tabCount <= 1) {
-            return false;
-        }
-
+        // Deliberately no last-tab guard: an unpinned final tab may close.
         return true;
     }
 
@@ -135,35 +111,21 @@
     }
 
     function isCoolingDown() {
-        return (
-            Date.now() - state.lastActionTime <
-            CONFIG.ACTION_COOLDOWN_MS
-        );
+        return Date.now() - state.lastActionTime < CONFIG.ACTION_COOLDOWN_MS;
     }
 
     function closeCurrentTab() {
         const tab = getSelectedTab();
-
-        if (!tab || !canCloseCurrentTab()) {
-            return false;
-        }
+        if (!tab || !canCloseCurrentTab()) return false;
 
         state.isClosingTab = true;
 
         try {
-            window.gBrowser.removeTab(tab, {
-                animate: true
-            });
-
-            log("Closed tab because no back history was available.");
+            window.gBrowser.removeTab(tab, { animate: true });
+            log("Closed unpinned tab because no Back history was available.");
             return true;
         } catch (error) {
-            state.isClosingTab = false;
-            console.error(
-                `[${SCRIPT_NAME}] Failed to close tab:`,
-                error
-            );
-
+            console.error(`[${SCRIPT_NAME}] Failed to close tab:`, error);
             return false;
         } finally {
             window.setTimeout(() => {
@@ -172,24 +134,14 @@
         }
     }
 
-    /**
-     * Used for:
-     * - Alt + Left
-     * - Browser Back key
-     * - Toolbar Back button
-     * - Browser:Back command
-     *
-     * When history exists, Firefox/Zen handles Back normally.
-     */
+    // Used by keyboard, BrowserBack, toolbar button, and Browser:Back.
     function handleCloseInsteadOfBack() {
-        if (!shouldCloseCurrentTab()) {
-            return false;
-        }
+        // Let Zen handle Back natively whenever history exists.
+        // Replace Back with Close only when history is definitely unavailable.
+        if (!shouldCloseCurrentTab()) return false;
 
-        // Swallow duplicated click/command events.
-        if (isCoolingDown()) {
-            return true;
-        }
+        // Consume duplicate events generated by the same physical action.
+        if (isCoolingDown()) return true;
 
         if (closeCurrentTab()) {
             state.lastActionTime = Date.now();
@@ -199,35 +151,19 @@
         return false;
     }
 
-    /**
-     * Trackpad gestures are fully handled here so one physical
-     * gesture cannot navigate back and then close the tab.
-     */
+    // Trackpad gestures are handled fully here to avoid Back followed by Close.
     function handleSwipeBackIntent() {
-        if (isCoolingDown()) {
-            return true;
-        }
-
         const canGoBack = getCanGoBack();
 
-        if (canGoBack === true) {
-            try {
-                getSelectedBrowser().webNavigation.goBack();
-                state.lastActionTime = Date.now();
-
-                log("Navigated back.");
-                return true;
-            } catch (error) {
-                console.error(
-                    `[${SCRIPT_NAME}] Failed to navigate back:`,
-                    error
-                );
-
-                return false;
-            }
+        // Never navigate manually. Zen keeps full control of native history.
+        if (canGoBack === true || canGoBack === null) {
+            return false;
         }
 
-        if (canGoBack === false && closeCurrentTab()) {
+        // Only a historyless, unpinned tab is closed.
+        if (isCoolingDown()) return true;
+
+        if (closeCurrentTab()) {
             state.lastActionTime = Date.now();
             return true;
         }
@@ -242,16 +178,16 @@
                 event.altKey &&
                 !event.ctrlKey &&
                 !event.metaKey &&
+                !event.shiftKey &&
                 event.key === "ArrowLeft"
             )
         );
     }
 
     function eventPathContains(event, predicate) {
-        const path =
-            typeof event.composedPath === "function"
-                ? event.composedPath()
-                : [event.target];
+        const path = typeof event.composedPath === "function"
+            ? event.composedPath()
+            : [event.target];
 
         return path.some(node => {
             try {
@@ -267,14 +203,17 @@
             event,
             node =>
                 node?.id === "back-button" ||
-                node?.getAttribute?.("command") === "Browser:Back"
+                node?.getAttribute?.("command") === "Browser:Back" ||
+                node?.getAttribute?.("command") === "Browser:BackOrBackDuplicate"
         );
     }
 
     function isBrowserBackCommand(event) {
         return eventPathContains(
             event,
-            node => node?.id === "Browser:Back"
+            node =>
+                node?.id === "Browser:Back" ||
+                node?.id === "Browser:BackOrBackDuplicate"
         );
     }
 
@@ -292,10 +231,7 @@
         }
     }
 
-    /**
-     * Pointer-down can detect the Back button even when the browser
-     * visually disables it because there is no history.
-     */
+    // Pointer-down also catches a visually disabled Back button.
     function onPointerDown(event) {
         if (
             !event.isTrusted ||
@@ -311,12 +247,7 @@
     }
 
     function onClick(event) {
-        if (
-            !event.isTrusted ||
-            !isBackButtonEvent(event)
-        ) {
-            return;
-        }
+        if (!event.isTrusted || !isBackButtonEvent(event)) return;
 
         if (handleCloseInsteadOfBack()) {
             suppressEvent(event);
@@ -324,11 +255,67 @@
     }
 
     function onCommand(event) {
-        if (!isBrowserBackCommand(event)) {
+        if (!isBrowserBackCommand(event)) return;
+
+        if (handleCloseInsteadOfBack()) {
+            suppressEvent(event);
+        }
+    }
+
+    // Zen/Firefox uses native macOS MozSwipeGesture events. When a tab has
+    // no history, Zen normally rejects the gesture before a final swipe event
+    // is generated. Claim that direction so it can become Close Tab.
+    function isNativeBackSwipe(event) {
+        return (
+            typeof event.DIRECTION_LEFT === "number" &&
+            event.direction === event.DIRECTION_LEFT
+        );
+    }
+
+    function onNativeSwipeMayStart(event) {
+        if (!event.isTrusted || !isNativeBackSwipe(event)) return;
+
+        // Claim a momentum-generated duplicate while the previous Back action
+        // is locked, preventing it from becoming a second navigation/close.
+        if (isCoolingDown()) {
+            event.allowedDirections = event.DIRECTION_LEFT;
+            if (event.cancelable) {
+                event.preventDefault();
+            }
             return;
         }
 
-        if (handleCloseInsteadOfBack()) {
+        // Zen rejects Back gestures when no history exists. Claim that case so
+        // the final swipe event can close exactly one unpinned tab.
+        if (shouldCloseCurrentTab()) {
+            event.allowedDirections = event.DIRECTION_LEFT;
+            if (event.cancelable) {
+                event.preventDefault();
+            }
+        }
+    }
+
+    function onNativeSwipe(event) {
+        if (!event.isTrusted || !isNativeBackSwipe(event)) return;
+
+        // One physical accelerated macOS swipe can emit another completed
+        // gesture after the first history step. Block every extra completion.
+        if (isCoolingDown()) {
+            suppressEvent(event);
+            return;
+        }
+
+        const canGoBack = getCanGoBack();
+
+        if (canGoBack === true) {
+            // Reserve this physical gesture before allowing Zen to perform
+            // exactly one native history step.
+            state.lastActionTime = Date.now();
+            return;
+        }
+
+        if (canGoBack === false && closeCurrentTab()) {
+            state.lastActionTime = Date.now();
             suppressEvent(event);
         }
     }
@@ -336,10 +323,7 @@
     function getContentRoot() {
         for (const selector of CONFIG.CONTENT_SELECTORS) {
             const element = document.querySelector(selector);
-
-            if (element) {
-                return element;
-            }
+            if (element) return element;
         }
 
         return null;
@@ -347,11 +331,7 @@
 
     function isContentWheelEvent(event) {
         const contentRoot = getContentRoot();
-
-        return Boolean(
-            contentRoot &&
-            contentRoot.contains(event.target)
-        );
+        return Boolean(contentRoot && contentRoot.contains(event.target));
     }
 
     function normalizeWheelDelta(event) {
@@ -360,10 +340,7 @@
         if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
             multiplier = 16;
         } else if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
-            multiplier = Math.max(
-                window.innerWidth,
-                window.innerHeight
-            );
+            multiplier = Math.max(window.innerWidth, window.innerHeight);
         }
 
         return {
@@ -403,7 +380,7 @@
     }
 
     function onWheel(event) {
-        // Ctrl + wheel is often pinch-to-zoom on trackpads.
+        // Ctrl+wheel is commonly trackpad pinch-to-zoom.
         if (
             !event.isTrusted ||
             event.defaultPrevented ||
@@ -415,25 +392,17 @@
 
         const now = Date.now();
 
-        if (
-            now - state.lastWheelTime >
-            CONFIG.GESTURE_RESET_MS
-        ) {
+        if (now - state.lastWheelTime > CONFIG.GESTURE_RESET_MS) {
             resetGesture();
         }
 
         state.lastWheelTime = now;
         scheduleGestureReset();
 
-        if (state.gestureHandled) {
-            return;
-        }
+        if (state.gestureHandled) return;
 
         const { x, y } = normalizeWheelDelta(event);
-
-        if (x === 0) {
-            return;
-        }
+        if (x === 0) return;
 
         const absX = Math.abs(x);
         const absY = Math.abs(y);
@@ -441,13 +410,10 @@
         state.horizontalDistance += absX;
         state.verticalDistance += absY;
 
-        /*
-         * Opposite-direction movement reduces the accumulated
-         * distance, preventing shaky gestures from firing.
-         */
         if (isBackDirection(x)) {
             state.backDistance += absX;
         } else {
+            // Shaky movement in the opposite direction reduces progress.
             state.backDistance = Math.max(
                 0,
                 state.backDistance - absX * 1.5
@@ -456,8 +422,7 @@
 
         const isMostlyHorizontal =
             state.horizontalDistance >=
-            state.verticalDistance *
-                CONFIG.HORIZONTAL_DOMINANCE_RATIO;
+            state.verticalDistance * CONFIG.HORIZONTAL_DOMINANCE_RATIO;
 
         if (
             isMostlyHorizontal &&
@@ -472,23 +437,10 @@
     }
 
     function destroy() {
-        for (
-            const {
-                target,
-                type,
-                listener,
-                options
-            } of state.listeners.splice(0)
-        ) {
+        for (const { target, type, listener, options } of state.listeners.splice(0)) {
             try {
-                target.removeEventListener(
-                    type,
-                    listener,
-                    options
-                );
-            } catch (_) {
-                // Ignore cleanup errors during browser shutdown.
-            }
+                target.removeEventListener(type, listener, options);
+            } catch (_) {}
         }
 
         resetGesture();
@@ -502,6 +454,7 @@
 
     const api = Object.freeze({
         config: CONFIG,
+        getCanGoBack,
         destroy
     });
 
@@ -511,18 +464,178 @@
     addListener(window, "pointerdown", onPointerDown, true);
     addListener(window, "click", onClick, true);
     addListener(window, "command", onCommand, true);
-
+    addListener(window, "MozSwipeGestureMayStart", onNativeSwipeMayStart, {
+        capture: true,
+        passive: false
+    });
+    addListener(window, "MozSwipeGesture", onNativeSwipe, {
+        capture: true,
+        passive: false
+    });
     addListener(window, "wheel", onWheel, {
         capture: true,
         passive: false
     });
-
-    addListener(window, "unload", destroy, {
-        once: true
-    });
+    addListener(window, "unload", destroy, { once: true });
 
     console.log(
-        `[${SCRIPT_NAME}] Loaded — Back closes tabs with no history; ` +
+        `[${SCRIPT_NAME}] Loaded — Back closes unpinned tabs without history; ` +
         `swipe threshold: ${CONFIG.SWIPE_THRESHOLD_PX}px.`
     );
+})();
+
+// zen-btt-glance-state.uc.js
+// Sends GLANCE or NORMAL to BetterTouchTool variable "zen_tab_type".
+(function () {
+    "use strict";
+
+    const SCRIPT_NAME = "zenBTTGlanceState";
+    const VARIABLE_NAME = "zen_tab_type";
+    const DEBOUNCE_MS = 40;
+
+    const previous = window[SCRIPT_NAME];
+    if (previous && typeof previous.destroy === "function") {
+        previous.destroy();
+    }
+
+    let observer = null;
+    let timer = null;
+    let retryTimer = null;
+    let lastState = null;
+    let destroyed = false;
+    const listeners = [];
+
+    function addListener(target, type, listener, options) {
+        target.addEventListener(type, listener, options);
+        listeners.push({ target, type, listener, options });
+    }
+
+    function getState() {
+        const selectedTab = window.gBrowser?.selectedTab;
+        const selectedGlance = document.querySelector(
+            'tab[zen-glance-tab][selected="true"], tab[zen-glance-tab][selected]'
+        );
+
+        return (
+            selectedTab?.hasAttribute?.("zen-glance-tab") ||
+            Boolean(selectedGlance)
+        ) ? "GLANCE" : "NORMAL";
+    }
+
+    async function notifyBTT(force = false) {
+        if (destroyed) return;
+
+        const state = getState();
+        if (!force && state === lastState) return;
+
+        const url =
+            "btt://set_string_variable/?" +
+            "variableName=" + encodeURIComponent(VARIABLE_NAME) +
+            "&to=" + encodeURIComponent(state);
+
+        try {
+            const { Subprocess } = ChromeUtils.importESModule(
+                "resource://gre/modules/Subprocess.sys.mjs"
+            );
+
+            await Subprocess.call({
+                command: "/usr/bin/open",
+                arguments: ["-g", url]
+            });
+
+            lastState = state;
+            console.log(
+                `[${SCRIPT_NAME}] BetterTouchTool state: ${state}`
+            );
+        } catch (error) {
+            console.error(
+                `[${SCRIPT_NAME}] Could not notify BetterTouchTool:`,
+                error
+            );
+        }
+    }
+
+    function scheduleUpdate(force = false) {
+        if (timer !== null) {
+            window.clearTimeout(timer);
+        }
+
+        timer = window.setTimeout(() => {
+            timer = null;
+            notifyBTT(force);
+        }, DEBOUNCE_MS);
+    }
+
+    function start() {
+        if (destroyed) return;
+
+        if (!window.gBrowser || !document.documentElement) {
+            retryTimer = window.setTimeout(start, 250);
+            return;
+        }
+
+        observer = new MutationObserver(() => scheduleUpdate());
+
+        observer.observe(document.documentElement, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: [
+                "selected",
+                "zen-glance-tab"
+            ]
+        });
+
+        addListener(
+            window.gBrowser.tabContainer,
+            "TabSelect",
+            () => scheduleUpdate(),
+            true
+        );
+        addListener(window, "focus", () => scheduleUpdate(true), true);
+        addListener(window, "unload", destroy, { once: true });
+
+        scheduleUpdate(true);
+        console.log(
+            `[${SCRIPT_NAME}] Loaded — syncing Zen Glance state to BTT.`
+        );
+    }
+
+    function destroy() {
+        destroyed = true;
+
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+
+        if (timer !== null) {
+            window.clearTimeout(timer);
+            timer = null;
+        }
+
+        if (retryTimer !== null) {
+            window.clearTimeout(retryTimer);
+            retryTimer = null;
+        }
+
+        for (const { target, type, listener, options } of listeners.splice(0)) {
+            try {
+                target.removeEventListener(type, listener, options);
+            } catch (_) {}
+        }
+
+        if (window[SCRIPT_NAME] === api) {
+            delete window[SCRIPT_NAME];
+        }
+    }
+
+    const api = Object.freeze({
+        getState,
+        notifyBTT,
+        destroy
+    });
+
+    window[SCRIPT_NAME] = api;
+    start();
 })();

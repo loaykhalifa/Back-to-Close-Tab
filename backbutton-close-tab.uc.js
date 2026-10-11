@@ -41,7 +41,10 @@
         horizontalDistance: 0,
         verticalDistance: 0,
         gestureResetTimer: null,
-        listeners: []
+        listeners: [],
+        lastPointerX: null,
+        lastPointerY: null,
+        nativeSwipeStartedInContent: false
     };
 
     function log(...args) {
@@ -73,6 +76,71 @@
 
     function getSelectedTab() {
         return window.gBrowser?.selectedTab || null;
+    }
+
+    function rememberPointerPosition(event) {
+        if (
+            Number.isFinite(event.clientX) &&
+            Number.isFinite(event.clientY)
+        ) {
+            state.lastPointerX = event.clientX;
+            state.lastPointerY = event.clientY;
+        }
+    }
+
+    function getGesturePoint(event) {
+        // Some MozSwipeGesture events do not expose useful client
+        // coordinates. Fall back to the most recent pointer location.
+        if (
+            Number.isFinite(event?.clientX) &&
+            Number.isFinite(event?.clientY) &&
+            (event.clientX !== 0 || event.clientY !== 0)
+        ) {
+            return { x: event.clientX, y: event.clientY };
+        }
+
+        if (
+            Number.isFinite(event?.screenX) &&
+            Number.isFinite(event?.screenY) &&
+            Number.isFinite(window.mozInnerScreenX) &&
+            Number.isFinite(window.mozInnerScreenY) &&
+            (event.screenX !== 0 || event.screenY !== 0)
+        ) {
+            return {
+                x: event.screenX - window.mozInnerScreenX,
+                y: event.screenY - window.mozInnerScreenY
+            };
+        }
+
+        if (
+            Number.isFinite(state.lastPointerX) &&
+            Number.isFinite(state.lastPointerY)
+        ) {
+            return {
+                x: state.lastPointerX,
+                y: state.lastPointerY
+            };
+        }
+
+        return null;
+    }
+
+    function isPointerOverWebPage(event) {
+        const browser = getSelectedBrowser();
+        const point = getGesturePoint(event);
+
+        if (!browser || !point) return false;
+
+        const rect = browser.getBoundingClientRect();
+
+        return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            point.x >= rect.left &&
+            point.x < rect.right &&
+            point.y >= rect.top &&
+            point.y < rect.bottom
+        );
     }
 
     // true: can navigate back, false: no history, null: could not determine safely.
@@ -275,8 +343,14 @@
     function onNativeSwipeMayStart(event) {
         if (!event.isTrusted || !isNativeBackSwipe(event)) return;
 
-        // Claim a momentum-generated duplicate while the previous Back action
-        // is locked, preventing it from becoming a second navigation/close.
+        state.nativeSwipeStartedInContent = isPointerOverWebPage(event);
+
+        // Never claim or modify gestures that start over tabs, the sidebar,
+        // toolbars, menus, or any other browser interface.
+        if (!state.nativeSwipeStartedInContent) {
+            return;
+        }
+
         if (isCoolingDown()) {
             event.allowedDirections = event.DIRECTION_LEFT;
             if (event.cancelable) {
@@ -285,8 +359,6 @@
             return;
         }
 
-        // Zen rejects Back gestures when no history exists. Claim that case so
-        // the final swipe event can close exactly one unpinned tab.
         if (shouldCloseCurrentTab()) {
             event.allowedDirections = event.DIRECTION_LEFT;
             if (event.cancelable) {
@@ -298,8 +370,17 @@
     function onNativeSwipe(event) {
         if (!event.isTrusted || !isNativeBackSwipe(event)) return;
 
-        // One physical accelerated macOS swipe can emit another completed
-        // gesture after the first history step. Block every extra completion.
+        const startedInContent =
+            state.nativeSwipeStartedInContent ||
+            isPointerOverWebPage(event);
+
+        state.nativeSwipeStartedInContent = false;
+
+        // Leave sidebar and browser-interface gestures entirely to Zen.
+        if (!startedInContent) {
+            return;
+        }
+
         if (isCoolingDown()) {
             suppressEvent(event);
             return;
@@ -308,8 +389,6 @@
         const canGoBack = getCanGoBack();
 
         if (canGoBack === true) {
-            // Reserve this physical gesture before allowing Zen to perform
-            // exactly one native history step.
             state.lastActionTime = Date.now();
             return;
         }
@@ -385,7 +464,7 @@
             !event.isTrusted ||
             event.defaultPrevented ||
             event.ctrlKey ||
-            !isContentWheelEvent(event)
+            !isPointerOverWebPage(event)
         ) {
             return;
         }
@@ -471,6 +550,10 @@
     addListener(window, "MozSwipeGesture", onNativeSwipe, {
         capture: true,
         passive: false
+    });
+    addListener(window, "pointermove", rememberPointerPosition, {
+        capture: true,
+        passive: true
     });
     addListener(window, "wheel", onWheel, {
         capture: true,

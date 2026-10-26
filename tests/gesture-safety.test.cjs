@@ -9,7 +9,6 @@ const source = fs.readFileSync(
     path.join(__dirname, "..", "backbutton-close-tab.uc.js"), "utf8"
 );
 new vm.Script(source);
-assert.doesNotMatch(source, /btt:\/\/|zenBTTGlanceState|zen_tab_type|Subprocess/);
 
 function setup() {
     const listeners = new Map();

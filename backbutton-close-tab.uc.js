@@ -23,13 +23,7 @@
         // Pinned tabs are protected. Unpinned tabs may close even when last.
         CLOSE_PINNED_TABS: false,
 
-        DEBUG: false,
-
-        CONTENT_SELECTORS: [
-            "#zen-appcontent-wrapper",
-            "#appcontent",
-            "#browser"
-        ]
+        DEBUG: false
     });
 
     const state = {
@@ -44,7 +38,10 @@
         listeners: [],
         lastPointerX: null,
         lastPointerY: null,
-        nativeSwipeStartedInContent: false
+        nativeSwipe: null,
+        wheelBrowser: null,
+        wheelTab: null,
+        wheelCanClose: false
     };
 
     function log(...args) {
@@ -79,6 +76,7 @@
     }
 
     function rememberPointerPosition(event) {
+        if (!event.isTrusted) return;
         if (
             Number.isFinite(event.clientX) &&
             Number.isFinite(event.clientY)
@@ -126,21 +124,37 @@
     }
 
     function isPointerOverWebPage(event) {
-        const browser = getSelectedBrowser();
-        const point = getGesturePoint(event);
+        try {
+            const browser = getSelectedBrowser();
+            const point = getGesturePoint(event);
+            if (!browser?.isConnected || !point ||
+                document.hidden || !document.hasFocus()) return false;
 
-        if (!browser || !point) return false;
+            const rect = browser.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0 ||
+                point.x < rect.left || point.x >= rect.right ||
+                point.y < rect.top || point.y >= rect.bottom) return false;
 
-        const rect = browser.getBoundingClientRect();
+            // Require the actual selected browser, not just its bounding box.
+            // Spaces/sidebar/toolbar/overlay hits are left entirely to Zen.
+            return document.elementFromPoint(point.x, point.y) === browser;
+        } catch (error) {
+            log("Could not verify the page under the pointer:", error);
+            return false;
+        }
+    }
 
-        return (
-            rect.width > 0 &&
-            rect.height > 0 &&
-            point.x >= rect.left &&
-            point.x < rect.right &&
-            point.y >= rect.top &&
-            point.y < rect.bottom
-        );
+    function clearPointerAndGestures() {
+        state.lastPointerX = null;
+        state.lastPointerY = null;
+        state.nativeSwipe = null;
+        resetGesture();
+    }
+
+    function onPointerOut(event) {
+        if (event.isTrusted && event.relatedTarget === null) {
+            clearPointerAndGestures();
+        }
     }
 
     // true: can navigate back, false: no history, null: could not determine safely.
@@ -150,9 +164,10 @@
             if (!webNavigation) return null;
 
             const value = webNavigation.canGoBack;
-            return typeof value === "function"
-                ? Boolean(value.call(webNavigation))
-                : Boolean(value);
+            const result = typeof value === "function"
+                ? value.call(webNavigation)
+                : value;
+            return typeof result === "boolean" ? result : null;
         } catch (error) {
             log("Could not read navigation state:", error);
             return null;
@@ -341,76 +356,38 @@
     }
 
     function onNativeSwipeMayStart(event) {
-        if (!event.isTrusted || !isNativeBackSwipe(event)) return;
+        state.nativeSwipe = null;
+        if (!event.isTrusted || !isNativeBackSwipe(event) ||
+            !isPointerOverWebPage(event) || isCoolingDown() ||
+            !shouldCloseCurrentTab()) return;
 
-        state.nativeSwipeStartedInContent = isPointerOverWebPage(event);
-
-        // Never claim or modify gestures that start over tabs, the sidebar,
-        // toolbars, menus, or any other browser interface.
-        if (!state.nativeSwipeStartedInContent) {
-            return;
-        }
-
-        if (isCoolingDown()) {
-            event.allowedDirections = event.DIRECTION_LEFT;
-            if (event.cancelable) {
-                event.preventDefault();
-            }
-            return;
-        }
-
-        if (shouldCloseCurrentTab()) {
-            event.allowedDirections = event.DIRECTION_LEFT;
-            if (event.cancelable) {
-                event.preventDefault();
-            }
-        }
+        // Arm only a historyless tab; never close a different tab later.
+        state.nativeSwipe = {
+            browser: getSelectedBrowser(),
+            tab: getSelectedTab(),
+            time: Date.now()
+        };
+        event.allowedDirections = event.DIRECTION_LEFT;
+        if (event.cancelable) event.preventDefault();
     }
 
     function onNativeSwipe(event) {
-        if (!event.isTrusted || !isNativeBackSwipe(event)) return;
-
-        const startedInContent =
-            state.nativeSwipeStartedInContent ||
-            isPointerOverWebPage(event);
-
-        state.nativeSwipeStartedInContent = false;
-
-        // Leave sidebar and browser-interface gestures entirely to Zen.
-        if (!startedInContent) {
-            return;
-        }
+        const gesture = state.nativeSwipe;
+        state.nativeSwipe = null;
+        if (!event.isTrusted || !isNativeBackSwipe(event) || !gesture ||
+            Date.now() - gesture.time > 2000 ||
+            gesture.browser !== getSelectedBrowser() ||
+            gesture.tab !== getSelectedTab() ||
+            !isPointerOverWebPage(event) ||
+            !shouldCloseCurrentTab()) return;
 
         if (isCoolingDown()) {
             suppressEvent(event);
             return;
         }
-
-        const canGoBack = getCanGoBack();
-
-        if (canGoBack === true) {
-            state.lastActionTime = Date.now();
-            return;
-        }
-
-        if (canGoBack === false && closeCurrentTab()) {
-            state.lastActionTime = Date.now();
-            suppressEvent(event);
-        }
-    }
-
-    function getContentRoot() {
-        for (const selector of CONFIG.CONTENT_SELECTORS) {
-            const element = document.querySelector(selector);
-            if (element) return element;
-        }
-
-        return null;
-    }
-
-    function isContentWheelEvent(event) {
-        const contentRoot = getContentRoot();
-        return Boolean(contentRoot && contentRoot.contains(event.target));
+        // Suppress before tab removal can change the selected browser.
+        suppressEvent(event);
+        if (closeCurrentTab()) state.lastActionTime = Date.now();
     }
 
     function normalizeWheelDelta(event) {
@@ -429,6 +406,9 @@
     }
 
     function resetGesture() {
+        state.wheelBrowser = null;
+        state.wheelTab = null;
+        state.wheelCanClose = false;
         state.lastWheelTime = 0;
         state.gestureHandled = false;
         state.backDistance = 0;
@@ -459,58 +439,50 @@
     }
 
     function onWheel(event) {
-        // Ctrl+wheel is commonly trackpad pinch-to-zoom.
-        if (
-            !event.isTrusted ||
-            event.defaultPrevented ||
-            event.ctrlKey ||
-            !isPointerOverWebPage(event)
-        ) {
-            return;
-        }
-
+        if (!event.isTrusted) return;
         const now = Date.now();
+        if (now - state.lastWheelTime > CONFIG.GESTURE_RESET_MS) resetGesture();
 
-        if (now - state.lastWheelTime > CONFIG.GESTURE_RESET_MS) {
-            resetGesture();
-        }
-
+        const firstEvent = state.lastWheelTime === 0;
         state.lastWheelTime = now;
         scheduleGestureReset();
 
-        if (state.gestureHandled) return;
+        // Invalidate the entire burst, not just one event. A Spaces gesture
+        // must not turn into a page-close gesture as the UI moves underneath.
+        if (event.defaultPrevented || event.ctrlKey ||
+            !isPointerOverWebPage(event)) {
+            state.gestureHandled = true;
+            return;
+        }
+        if (firstEvent) {
+            state.wheelBrowser = getSelectedBrowser();
+            state.wheelTab = getSelectedTab();
+            state.wheelCanClose = shouldCloseCurrentTab();
+        }
+        if (state.gestureHandled ||
+            state.wheelBrowser !== getSelectedBrowser() ||
+            state.wheelTab !== getSelectedTab() ||
+            !state.wheelCanClose) {
+            state.gestureHandled = true;
+            return;
+        }
 
         const { x, y } = normalizeWheelDelta(event);
         if (x === 0) return;
-
         const absX = Math.abs(x);
-        const absY = Math.abs(y);
-
         state.horizontalDistance += absX;
-        state.verticalDistance += absY;
+        state.verticalDistance += Math.abs(y);
+        state.backDistance = isBackDirection(x)
+            ? state.backDistance + absX
+            : Math.max(0, state.backDistance - absX * 1.5);
 
-        if (isBackDirection(x)) {
-            state.backDistance += absX;
-        } else {
-            // Shaky movement in the opposite direction reduces progress.
-            state.backDistance = Math.max(
-                0,
-                state.backDistance - absX * 1.5
-            );
-        }
-
-        const isMostlyHorizontal =
-            state.horizontalDistance >=
-            state.verticalDistance * CONFIG.HORIZONTAL_DOMINANCE_RATIO;
-
-        if (
-            isMostlyHorizontal &&
-            state.backDistance >= CONFIG.SWIPE_THRESHOLD_PX
-        ) {
+        if (state.horizontalDistance >=
+                state.verticalDistance * CONFIG.HORIZONTAL_DOMINANCE_RATIO &&
+            state.backDistance >= CONFIG.SWIPE_THRESHOLD_PX) {
             state.gestureHandled = true;
-
-            if (handleSwipeBackIntent()) {
+            if (shouldCloseCurrentTab() && !isCoolingDown()) {
                 suppressEvent(event);
+                if (closeCurrentTab()) state.lastActionTime = Date.now();
             }
         }
     }
@@ -559,166 +531,12 @@
         capture: true,
         passive: false
     });
+    addListener(window, "pointerout", onPointerOut, true);
+    addListener(window, "blur", clearPointerAndGestures, true);
     addListener(window, "unload", destroy, { once: true });
 
     console.log(
         `[${SCRIPT_NAME}] Loaded — Back closes unpinned tabs without history; ` +
         `swipe threshold: ${CONFIG.SWIPE_THRESHOLD_PX}px.`
     );
-})();
-
-// zen-btt-glance-state.uc.js
-// Sends GLANCE or NORMAL to BetterTouchTool variable "zen_tab_type".
-(function () {
-    "use strict";
-
-    const SCRIPT_NAME = "zenBTTGlanceState";
-    const VARIABLE_NAME = "zen_tab_type";
-    const DEBOUNCE_MS = 40;
-
-    const previous = window[SCRIPT_NAME];
-    if (previous && typeof previous.destroy === "function") {
-        previous.destroy();
-    }
-
-    let observer = null;
-    let timer = null;
-    let retryTimer = null;
-    let lastState = null;
-    let destroyed = false;
-    const listeners = [];
-
-    function addListener(target, type, listener, options) {
-        target.addEventListener(type, listener, options);
-        listeners.push({ target, type, listener, options });
-    }
-
-    function getState() {
-        const selectedTab = window.gBrowser?.selectedTab;
-        const selectedGlance = document.querySelector(
-            'tab[zen-glance-tab][selected="true"], tab[zen-glance-tab][selected]'
-        );
-
-        return (
-            selectedTab?.hasAttribute?.("zen-glance-tab") ||
-            Boolean(selectedGlance)
-        ) ? "GLANCE" : "NORMAL";
-    }
-
-    async function notifyBTT(force = false) {
-        if (destroyed) return;
-
-        const state = getState();
-        if (!force && state === lastState) return;
-
-        const url =
-            "btt://set_string_variable/?" +
-            "variableName=" + encodeURIComponent(VARIABLE_NAME) +
-            "&to=" + encodeURIComponent(state);
-
-        try {
-            const { Subprocess } = ChromeUtils.importESModule(
-                "resource://gre/modules/Subprocess.sys.mjs"
-            );
-
-            await Subprocess.call({
-                command: "/usr/bin/open",
-                arguments: ["-g", url]
-            });
-
-            lastState = state;
-            console.log(
-                `[${SCRIPT_NAME}] BetterTouchTool state: ${state}`
-            );
-        } catch (error) {
-            console.error(
-                `[${SCRIPT_NAME}] Could not notify BetterTouchTool:`,
-                error
-            );
-        }
-    }
-
-    function scheduleUpdate(force = false) {
-        if (timer !== null) {
-            window.clearTimeout(timer);
-        }
-
-        timer = window.setTimeout(() => {
-            timer = null;
-            notifyBTT(force);
-        }, DEBOUNCE_MS);
-    }
-
-    function start() {
-        if (destroyed) return;
-
-        if (!window.gBrowser || !document.documentElement) {
-            retryTimer = window.setTimeout(start, 250);
-            return;
-        }
-
-        observer = new MutationObserver(() => scheduleUpdate());
-
-        observer.observe(document.documentElement, {
-            subtree: true,
-            childList: true,
-            attributes: true,
-            attributeFilter: [
-                "selected",
-                "zen-glance-tab"
-            ]
-        });
-
-        addListener(
-            window.gBrowser.tabContainer,
-            "TabSelect",
-            () => scheduleUpdate(),
-            true
-        );
-        addListener(window, "focus", () => scheduleUpdate(true), true);
-        addListener(window, "unload", destroy, { once: true });
-
-        scheduleUpdate(true);
-        console.log(
-            `[${SCRIPT_NAME}] Loaded — syncing Zen Glance state to BTT.`
-        );
-    }
-
-    function destroy() {
-        destroyed = true;
-
-        if (observer) {
-            observer.disconnect();
-            observer = null;
-        }
-
-        if (timer !== null) {
-            window.clearTimeout(timer);
-            timer = null;
-        }
-
-        if (retryTimer !== null) {
-            window.clearTimeout(retryTimer);
-            retryTimer = null;
-        }
-
-        for (const { target, type, listener, options } of listeners.splice(0)) {
-            try {
-                target.removeEventListener(type, listener, options);
-            } catch (_) {}
-        }
-
-        if (window[SCRIPT_NAME] === api) {
-            delete window[SCRIPT_NAME];
-        }
-    }
-
-    const api = Object.freeze({
-        getState,
-        notifyBTT,
-        destroy
-    });
-
-    window[SCRIPT_NAME] = api;
-    start();
 })();
